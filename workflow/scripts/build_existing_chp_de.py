@@ -191,6 +191,7 @@ def calculate_efficiency(CHP_de):
 if __name__ == "__main__":
     if "snakemake" not in globals():
         path = "../submodules/pypsa-eur/scripts"
+        os.chdir("./dev/pypsa-ariadne/workflow/scripts")
         sys.path.insert(0, os.path.abspath(path))
         from _helpers import mock_snakemake
 
@@ -202,7 +203,7 @@ if __name__ == "__main__":
     combustion = pd.read_csv(snakemake.input.mastr_combustion, dtype={"Postleitzahl": str})
 
     geodata = pd.read_csv(
-        snakemake.input.plz_mapping[0],
+        snakemake.input.plz_mapping,
         index_col="plz",
         dtype={"plz": str},
         names=["plz", "lat", "lon"],
