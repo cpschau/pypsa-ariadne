@@ -119,11 +119,24 @@ def input_profile_offwind(w):
         for tech in ["offwind-ac", "offwind-dc", "offwind-float"]
         if (tech in config_provider("electricity", "renewable_carriers")(w))
     }
+    
+def input_heat_source_potentials(w):
 
+    return {
+        heat_source_name: resources(
+            "heat_source_potential_" + heat_source_name + "_base_s_{clusters}.csv"
+        )
+        for heat_source_name in config_provider(
+            "sector", "district_heating", "heat_utilisation_potentials"
+        )(w).keys()
+        if heat_source_name
+        in config_provider("sector", "heat_pump_sources", "urban central")(w)
+    }
 
 use rule prepare_sector_network from pypsaeur with:
     input:
         unpack(input_profile_offwind),
+        unpack(input_heat_source_potentials),
         **{
             k: v
             for k, v in rules.prepare_sector_network.input.items()
@@ -202,16 +215,104 @@ if config["sector"]["district_heating"]["add_subnodes"] and config["sector"][
     "district_heating"
 ].get("add_subnodes", True):
 
+    rule prepare_district_heating_subnodes:
+        params:
+            district_heating=config_provider("sector", "district_heating"),
+            baseyear=config_provider("scenario", "planning_horizons", 0),
+        input:
+            heating_technologies_nuts3=resources("heating_technologies_nuts3.geojson"),
+            regions_onshore=resources(
+                "regions_onshore_base_s_{clusters}.geojson"
+            ),
+            fernwaermeatlas="data/fernwaermeatlas/fernwaermeatlas.xlsx",
+            cities="data/fernwaermeatlas/cities_geolocations.geojson",
+            lau=storage(
+                "https://gisco-services.ec.europa.eu/distribution/v2/lau/download/ref-lau-2021-01m.geojson.zip",
+                keep_local=True,
+            ),
+        output:
+            district_heating_subnodes=resources(
+                "district_heating_subnodes_base_s_{clusters}.geojson"
+            ),
+            regions_onshore_extended=resources(
+                "regions_onshore_base-extended_s_{clusters}.geojson"
+            ),
+
+        resources:
+            mem_mb=1000,
+        script:
+            "scripts/prepare_district_heating_subnodes.py"
+
+    use rule build_temperature_profiles from pypsaeur with:
+        params:
+            **{k: v for k,v in rules.build_temperature_profiles.params.items()},
+        input:
+            **{
+                k: v
+                for k, v in rules.build_temperature_profiles.input.items()
+                if k != "regions_onshore"
+            },
+            regions_onshore=resources(
+                "regions_onshore_base-extended_s_{clusters}.geojson"
+            ),
+
+    use rule build_central_heating_temperature_profiles from pypsaeur with:
+        params:
+            **{k: v for k,v in rules.build_central_heating_temperature_profiles.params.items()},
+        input:
+            **{
+                k: v
+                for k, v in rules.build_central_heating_temperature_profiles.input.items()
+                if k != "regions_onshore"
+            },
+            regions_onshore=resources(
+                "regions_onshore_base-extended_s_{clusters}.geojson"
+            ),
+
+    use rule build_cop_profiles from pypsaeur with:
+        input:
+            **{
+                k: v
+                for k, v in rules.build_cop_profiles.input.items()
+                if k != "regions_onshore"
+            },
+            regions_onshore=resources(
+                "regions_onshore_base-extended_s_{clusters}.geojson"
+            ),
+    
+    use rule build_heat_source_potentials from pypsaeur with:
+        input:
+            **{
+                k: v
+                for k, v in rules.build_heat_source_potentials.input.items()
+                if k != "regions_onshore"
+            },
+            regions_onshore=resources(
+                "regions_onshore_base-extended_s_{clusters}.geojson"
+            ),
+
+
     baseyear_value = config["scenario"]["planning_horizons"][0]
 
     rule add_district_heating_subnodes:
         params:
             district_heating=config_provider("sector", "district_heating"),
             baseyear=config_provider("scenario", "planning_horizons", 0),
+            sector=config_provider("sector"),
+            heat_pump_sources=config_provider("sector", "heat_pump_sources", "urban central"),
+            heat_utilisation_potentials=config_provider(
+            "sector", "district_heating", "heat_utilisation_potentials"
+            ),
+            direct_utilisation_heat_sources=config_provider(
+                "sector", "district_heating", "direct_utilisation_heat_sources"
+            ),
         input:
+            unpack(input_heat_source_potentials),
             network=RESULTS
             + "prenetworks/base_s_{clusters}_l{ll}_{opts}_{sector_opts}_{planning_horizons}.nc",
-            heating_technologies_nuts3=resources("heating_technologies_nuts3.geojson"),
+            subnodes=resources(
+                "district_heating_subnodes_base_s_{clusters}.geojson"
+            ),
             nuts3=resources("nuts3_shapes.geojson"),
             regions_onshore=resources(
                 "regions_onshore_base_s_{clusters}.geojson"
@@ -225,6 +326,9 @@ if config["sector"]["district_heating"]["add_subnodes"] and config["sector"][
                 keep_local=True
                 ),
             cop_profiles=resources("cop_profiles_base_s_{clusters}_{planning_horizons}.nc"),
+            direct_heat_source_utilisation_profiles=resources(
+            "direct_heat_source_utilisation_profiles_base_s_{clusters}_{planning_horizons}.nc"
+            ),
             existing_heating_distribution=resources(
                 f"existing_heating_distribution_base_s_{{clusters}}_{baseyear_value}.csv"
             ),
@@ -237,9 +341,6 @@ if config["sector"]["district_heating"]["add_subnodes"] and config["sector"][
             + "prenetworks/base-extended_s_{clusters}_l{ll}_{opts}_{sector_opts}_{planning_horizons}.nc",
             district_heating_subnodes=resources(
                 "district_heating_subnodes_base_s_{clusters}_l{ll}_{opts}_{sector_opts}_{planning_horizons}.geojson"
-            ),
-            cop_profiles_extended=resources(
-                "cop_profiles_base-extended_s_{clusters}_l{ll}_{opts}_{sector_opts}_{planning_horizons}.nc"
             ),
             existing_heating_distribution_extended=(
                 resources(
@@ -443,7 +544,6 @@ use rule add_existing_baseyear from pypsaeur with:
             k: v
             for k, v in rules.add_existing_baseyear.input.items()
             if k != "network"
-            and k != "cop_profiles"
             and k != "existing_heating_distribution"
         },
         network=(
@@ -452,13 +552,6 @@ use rule add_existing_baseyear from pypsaeur with:
             if config["sector"]["district_heating"].get("add_subnodes", True)
             else RESULTS
             + "prenetworks/base_s_{clusters}_l{ll}_{opts}_{sector_opts}_{planning_horizons}.nc"
-        ),
-        cop_profiles=(
-            resources(
-                "cop_profiles_base-extended_s_{clusters}_l{ll}_{opts}_{sector_opts}_{planning_horizons}.nc"
-            )
-            if config["sector"]["district_heating"].get("add_subnodes", True)
-            else resources("cop_profiles_base_s_{clusters}_{planning_horizons}.nc")
         ),
         custom_powerplants=resources(
             "german_chp_base_s_{clusters}_l{ll}_{opts}_{sector_opts}_{planning_horizons}.csv"
@@ -494,6 +587,7 @@ use rule add_brownfield from pypsaeur with:
             + "prenetworks/base_s_{clusters}_l{ll}_{opts}_{sector_opts}_{planning_horizons}.nc"
         ),
 
+ruleorder: add_existing_baseyear > add_brownfield
 
 use rule build_existing_heating_distribution from pypsaeur with:
     input:

@@ -4,15 +4,15 @@
 
 # docs in https://pypsa-eur.readthedocs.io/en/latest/configuration.html#run
 run:
-  prefix: 20241204_ptes_land_eligibility
+  prefix: 20241206_ptes_land_eligibility_geothermal
   name:
   - KN2045_Bal_v4
-  - KN2045_Elec_v4
-  - KN2045_H2_v4
-  - KN2045plus_EasyRide
-  - KN2045plus_LowDemand
-  - KN2045minus_WorstCase
-  - KN2045minus_SupplyFocus
+  # - KN2045_Elec_v4
+  # - KN2045_H2_v4
+  # - KN2045plus_EasyRide
+  # - KN2045plus_LowDemand
+  # - KN2045minus_WorstCase
+  # - KN2045minus_SupplyFocus
   scenarios:
     enable: true
     manual_file: config/scenarios.manual.yaml
@@ -68,10 +68,10 @@ scenario:
   - none
   planning_horizons:
   - 2020
-  - 2025
-  - 2030
-  - 2035
-  - 2040
+  # - 2025
+  # - 2030
+  # - 2035
+  # - 2040
   - 2045
 
 existing_capacities:
@@ -278,10 +278,55 @@ sector:
       2040: 0.6
       2045: 0.8
       2050: 1.0
-    add_subnodes: false
+    supply_temperature_approximation:
+      max_forward_temperature_baseyear:
+        FR: 110
+        DK: 75
+        DE: 109
+        CZ: 130
+        FI: 115
+        PL: 130
+        SE: 102
+        IT: 90
+      min_forward_temperature_baseyear:
+        DE: 82
+      return_temperature_baseyear:
+        DE: 58
+      lower_threshold_ambient_temperature: 0
+      upper_threshold_ambient_temperature: 10
+      rolling_window_ambient_temperature: 72
+      relative_annual_temperature_reduction: 0.01
+    heat_source_cooling: 6 #K
+    heat_pump_cop_approximation:
+      refrigerant: ammonia
+      heat_exchanger_pinch_point_temperature_difference: 5 #K
+      isentropic_compressor_efficiency: 0.8
+      heat_loss: 0.0
+    heat_utilisation_potentials:
+      geothermal:
+        # activate for 85C hydrothermal
+        # key: hydrothermal_85
+        # constant_temperature_celsius: 85
+        key: hydrothermal_65
+        constant_temperature_celsius: 65
+        column_name: Energy_TWh
+        unit: TWh
+        full_load_hours: 4000
+    direct_utilisation_heat_sources:
+    - geothermal
+    add_subnodes: true
     ptes_codes_corine: [26, 28, 30, 32, 33]
     max_groundwater_depth: -19
     ptes_potential_scalar: 1
+  heat_pump_sources:
+    urban central:
+    - air
+    - geothermal
+    urban decentral:
+    - air
+    rural:
+    - air
+    - ground
   central_heat_vent: true
   co2_spatial: true
   biomass_spatial: true

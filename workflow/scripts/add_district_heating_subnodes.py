@@ -15,58 +15,6 @@ from atlite.gis import ExclusionContainer
 from atlite.gis import shape_availability
 
 
-# Function to encode city names in UTF-8
-def encode_utf8(city_name):
-    return city_name.encode("utf-8")
-
-
-def prepare_subnodes(subnodes, cities, regions_onshore, lau, heat_techs):
-    # TODO: Embed I&O in snakemake rule, add potentials, match CHP capacities
-
-    subnodes["Stadt"] = subnodes["Stadt"].str.split("_").str[0]
-
-    # Drop duplicates if Gelsenkirchen, Kiel, or Flensburg is included and keep the one with higher Wärmeeinspeisung in GWh/a
-    subnodes = subnodes.drop_duplicates(subset="Stadt", keep="first")
-
-    subnodes["yearly_heat_demand_MWh"] = subnodes["Wärmeeinspeisung in GWh/a"] * 1e3
-
-    logger.info(
-        f"The selected district heating networks have an overall yearly heat demand of {subnodes['yearly_heat_demand_MWh'].sum()} MWh/a. "
-    )
-
-    subnodes["geometry"] = subnodes["Stadt"].apply(
-        lambda s: cities.loc[cities["Stadt"] == s, "geometry"].values[0]
-    )
-
-    subnodes = subnodes.dropna(subset=["geometry"])
-    # Convert the DataFrame to a GeoDataFrame
-    subnodes = gpd.GeoDataFrame(subnodes, crs="EPSG:4326")
-
-    # Assign cluster to subnodes according to onshore regions
-    subnodes["cluster"] = subnodes.apply(
-        lambda x: regions_onshore.geometry.contains(x.geometry).idxmax(), axis=1
-    )
-    subnodes["lau"] = subnodes.apply(
-        lambda x: lau.loc[lau.geometry.contains(x.geometry).idxmax(), "LAU_ID"], axis=1
-    )
-    subnodes["lau_shape"] = subnodes.apply(
-        lambda x: lau.loc[lau.geometry.contains(x.geometry).idxmax(), "geometry"].wkt,
-        axis=1,
-    )
-    subnodes["nuts3"] = subnodes.apply(
-        lambda x: heat_techs.geometry.contains(x.geometry).idxmax(),
-        axis=1,
-    )
-    subnodes["nuts3_shape"] = subnodes.apply(
-        lambda x: heat_techs.loc[
-            heat_techs.geometry.contains(x.geometry).idxmax(), "geometry"
-        ].wkt,
-        axis=1,
-    )
-
-    return subnodes
-
-
 def add_ptes_limit(
     subnodes,
     corine,
@@ -157,7 +105,7 @@ def add_ptes_limit(
     return subnodes
 
 
-def add_subnodes(n, subnodes, head=40):
+def add_subnodes(n, subnodes, cop, direct_heat_source_utilisation_profile, head=40):
     """
     Add subnodes to the network and adjust loads and capacities accordingly.
     """
@@ -170,28 +118,24 @@ def add_subnodes(n, subnodes, head=40):
     subnodes_head = subnodes.sort_values(
         by="Wärmeeinspeisung in GWh/a", ascending=False
     ).head(head)
-    subnodes.to_file(snakemake.output.district_heating_subnodes, driver="GeoJSON")
+    subnodes_head.to_file(snakemake.output.district_heating_subnodes, driver="GeoJSON")
 
     subnodes_rest = subnodes[~subnodes.index.isin(subnodes_head.index)]
 
     # Add subnodes to network
     for idx, row in subnodes_head.iterrows():
-        name = f'{row["cluster"]} {row["Stadt"]} urban central heat'
+        name = f'{row["cluster"]} {row["Stadt"]} urban central'
 
         # Add buses
-        n.add(
-            "Bus",
-            name,
-            y=row.geometry.y,
-            x=row.geometry.x,
-            country="DE",
-            location=f"{row['cluster']} {row['Stadt']}",
-            carrier="urban central heat",
-            unit="MWh_th",
+        buses = (
+            n.buses.filter(like=f"{row['cluster']} urban central", axis=0)
+            .reset_index()
+            .replace({f"{row['cluster']} urban central": name}, regex=True)
+            .set_index("Bus")
         )
+        n.add("Bus", buses.index, **buses)
 
         # Add heat loads
-
         uch_load_cluster = (
             n.snapshot_weightings.generators
             @ n.loads_t.p_set[f"{row['cluster']} urban central heat"]
@@ -224,7 +168,7 @@ def add_subnodes(n, subnodes, head=40):
         n.add(
             "Load",
             name,
-            bus=name,
+            bus=f"{name} heat",
             p_set=uch_load,
             carrier="urban central heat",
             location=f"{row['cluster']} {row['Stadt']}",
@@ -240,7 +184,7 @@ def add_subnodes(n, subnodes, head=40):
         n.add(
             "Load",
             f"{row['cluster']} {row['Stadt']} low-temperature heat for industry",
-            bus=name,
+            bus=f"{name} heat",
             p_set=lti_load,
             carrier="low-temperature heat for industry",
             location=f"{row['cluster']} {row['Stadt']}",
@@ -254,16 +198,7 @@ def add_subnodes(n, subnodes, head=40):
             1 - scalar * lti_share
         )
 
-        # Replicate district heating stores and links of mother node for subnodes
-
-        n.add(
-            "Bus",
-            f"{row['cluster']} {row['Stadt']} urban central water tanks",
-            location=f"{row['cluster']} {row['Stadt']}",
-            carrier="urban central water tanks",
-            unit="MWh_th",
-        )
-
+        # Replicate district heating stores of mother node for subnodes
         stores = (
             n.stores.filter(like=f"{row['cluster']} urban central", axis=0)
             .reset_index()
@@ -279,8 +214,31 @@ def add_subnodes(n, subnodes, head=40):
         stores["e_nom_max"] = row["ptes_pot_mwh"]
         n.add("Store", stores.index, **stores)
 
+        # restrict PTES capacity in mother nodes
+        mother_nodes_ptes_pot = subnodes_rest.groupby("cluster").ptes_pot_mwh.sum()
+        # add " urban central water tanks" to the mother node name
+        mother_nodes_ptes_pot.index = (
+            mother_nodes_ptes_pot.index + " urban central water tanks"
+        )
+        n.stores.loc[mother_nodes_ptes_pot.index, "e_nom_max"] = mother_nodes_ptes_pot
+
+        # Replicate district heating generators of mother node for subnodes
+        generators = (
+            n.generators.filter(like=f"{row['cluster']} urban central", axis=0)
+            .reset_index()
+            .replace(
+                {
+                    f"{row['cluster']} urban central": f"{row['cluster']} {row['Stadt']} urban central"
+                },
+                regex=True,
+            )
+            .set_index("Generator")
+        )
+        n.add("Generator", generators.index, **generators)
+
+        # Replicate district heating links of mother node for subnodes with separate treatment for links with dynamic efficiencies
         links = (
-            n.links.loc[~n.links.carrier.str.contains("heat pump")]
+            n.links.loc[~n.links.carrier.str.contains("heat pump|direct", regex=True)]
             .filter(like=f"{row['cluster']} urban central", axis=0)
             .reset_index()
             .replace(
@@ -293,46 +251,127 @@ def add_subnodes(n, subnodes, head=40):
         )
         n.add("Link", links.index, **links)
 
-        # Add heat pumps to subnode
-        heat_pumps = (
-            n.links.filter(regex=f"{row['cluster']} urban central.*heat pump", axis=0)
-            .reset_index()
-            .replace(
-                {
-                    f"{row['cluster']} urban central": f"{row['cluster']} {row['Stadt']} urban central"
-                },
-                regex=True,
+        # Add heat pumps and direct heat source utilization to subnode
+        for heat_source in snakemake.params.heat_pump_sources:
+            cop_heat_pump = (
+                cop.sel(
+                    heat_system="urban central",
+                    heat_source=heat_source,
+                    name=f"{row['cluster']} {row['Stadt']}",
+                )
+                .to_pandas()
+                .to_frame(name=f"{name} {heat_source} heat pump")
+                .reindex(index=n.snapshots)
+                if snakemake.params.sector["time_dep_hp_cop"]
+                else n.links.filter(like=heat_source, axis=0).efficiency.mode()
             )
-            .set_index("Link")
-        ).drop("efficiency", axis=1)
-        heat_pumps_t = n.links_t.efficiency.filter(
-            regex=f"{row['cluster']} urban central.*heat pump"
-        )
-        heat_pumps_t.columns = heat_pumps_t.columns.str.replace(
-            f"{row['cluster']} urban central",
-            f"{row['cluster']} {row['Stadt']} urban central",
-        )
-        n.add("Link", heat_pumps.index, efficiency=heat_pumps_t, **heat_pumps)
+
+            heat_pump = (
+                n.links.filter(
+                    regex=f"{row['cluster']} urban central.*{heat_source}.*heat pump",
+                    axis=0,
+                )
+                .reset_index()
+                .replace(
+                    {
+                        f"{row['cluster']} urban central": f"{row['cluster']} {row['Stadt']} urban central"
+                    },
+                    regex=True,
+                )
+                .drop(["efficiency", "efficiency2"], axis=1)
+                .set_index("Link")
+            )
+            if heat_pump["bus2"].notna().any():
+                n.add(
+                    "Link",
+                    heat_pump.index,
+                    efficiency=-(1 - cop_heat_pump),
+                    efficiency2=cop_heat_pump,
+                    **heat_pump,
+                )
+            else:
+                n.add("Link", heat_pump.index, efficiency=cop_heat_pump, **heat_pump)
+
+            if heat_source in snakemake.params.direct_utilisation_heat_sources:
+                # Add direct heat source utilization to subnode
+                efficiency_direct_utilisation = (
+                    direct_heat_source_utilisation_profile.sel(
+                        heat_source=heat_source,
+                        name=f"{row['cluster']} {row['Stadt']}",
+                    )
+                    .to_pandas()
+                    .to_frame(name=f"{name} {heat_source} heat direct utilisation")
+                    .reindex(index=n.snapshots)
+                )
+
+                direct_utilization = (
+                    n.links.filter(
+                        regex=f"{row['cluster']} urban central.*{heat_source}.*direct",
+                        axis=0,
+                    )
+                    .reset_index()
+                    .replace(
+                        {
+                            f"{row['cluster']} urban central": f"{row['cluster']} {row['Stadt']} urban central"
+                        },
+                        regex=True,
+                    )
+                    .set_index("Link")
+                    .drop("efficiency", axis=1)
+                )
+
+                n.add(
+                    "Link",
+                    direct_utilization.index,
+                    efficiency=efficiency_direct_utilisation,
+                    **direct_utilization,
+                )
+
+            if heat_source in snakemake.params.heat_utilisation_potentials:
+                # get potential
+                p_max_source = pd.read_csv(
+                    snakemake.input[heat_source],
+                    index_col=0,
+                ).squeeze()[f"{row['cluster']} {row['Stadt']}"]
+                # add potential to generator
+                n.generators.loc[
+                    f"{row['cluster']} {row['Stadt']} urban central {heat_source} heat",
+                    "p_nom_max",
+                ] = p_max_source
+
+        ###
+        # heat_pumps = (
+        #     n.links.filter(regex=f"{row['cluster']} urban central.*heat pump", axis=0)
+        #     .reset_index()
+        #     .replace(
+        #         {
+        #             f"{row['cluster']} urban central": f"{row['cluster']} {row['Stadt']} urban central"
+        #         },
+        #         regex=True,
+        #     )
+        #     .set_index("Link")
+        # ).drop("efficiency", axis=1)
+        # heat_pumps_t = n.links_t.efficiency.filter(
+        #     regex=f"{row['cluster']} urban central.*heat pump"
+        # )
+        # heat_pumps_t.columns = heat_pumps_t.columns.str.replace(
+        #     f"{row['cluster']} urban central",
+        #     f"{row['cluster']} {row['Stadt']} urban central",
+        # )
+        # n.add("Link", heat_pumps.index, efficiency=heat_pumps_t, **heat_pumps)
 
         # Add heat vent to subnode
-        n.add(
-            "Generator",
-            f"{name} heat vent",
-            bus=name,
-            location=f"{row['cluster']} {row['Stadt']}",
-            carrier="urban central heat vent",
-            p_nom_extendable=True,
-            p_min_pu=-1,
-            p_max_pu=0,
-            unit="MWh_th",
-        )
-    # restrict PTES capacity in mother nodes
-    mother_nodes_ptes_pot = subnodes_rest.groupby("cluster").ptes_pot_mwh.sum()
-    # add " urban central water tanks" to the mother node name
-    mother_nodes_ptes_pot.index = (
-        mother_nodes_ptes_pot.index + " urban central water tanks"
-    )
-    n.stores.loc[mother_nodes_ptes_pot.index, "e_nom_max"] = mother_nodes_ptes_pot
+        # n.add(
+        #     "Generator",
+        #     f"{name} heat vent",
+        #     bus=name,
+        #     location=f"{row['cluster']} {row['Stadt']}",
+        #     carrier="urban central heat vent",
+        #     p_nom_extendable=True,
+        #     p_min_pu=-1,
+        #     p_max_pu=0,
+        #     unit="MWh_th",
+        # )
 
     return
 
@@ -425,40 +464,14 @@ if __name__ == "__main__":
             ll="vopt",
             sector_opts="none",
             planning_horizons="2020",
-            run="0.5LTESCAPEX",
+            run="KN2045_Bal_v4",
         )
 
     logger.info("Adding SysGF-specific functionality")
 
     n = pypsa.Network(snakemake.input.network)
-    heat_techs = gpd.read_file(snakemake.input.heating_technologies_nuts3).set_index(
-        "index"
-    )
-    lau = gpd.read_file(
-        f"{snakemake.input.lau}!LAU_RG_01M_2021_3035.geojson",
-        crs="EPSG:3035",
-    ).to_crs("EPSG:4326")
 
-    fernwaermeatlas = pd.read_excel(
-        snakemake.input.fernwaermeatlas,
-        sheet_name="Fernwärmeatlas_öffentlich",
-    )
-    cities = gpd.read_file(snakemake.input.cities)
-    regions_onshore = gpd.read_file(snakemake.input.regions_onshore).set_index("name")
-    # Assign onshore region to heat techs based on geometry
-    heat_techs["cluster"] = heat_techs.apply(
-        lambda x: regions_onshore.geometry.contains(x.geometry).idxmax(),
-        axis=1,
-    )
-
-    subnodes = prepare_subnodes(
-        fernwaermeatlas,
-        cities,
-        regions_onshore,
-        lau,
-        heat_techs,
-    )
-    subnodes.to_file(snakemake.output.district_heating_subnodes, driver="GeoJSON")
+    subnodes = gpd.read_file(snakemake.input.subnodes)
 
     # Add PTES limit to subnodes according to land availability within city regions
     corine = rasterio.open(snakemake.input.corine)
@@ -480,13 +493,17 @@ if __name__ == "__main__":
     add_subnodes(
         n,
         subnodes,
+        cop=xr.open_dataarray(snakemake.input.cop_profiles),
+        direct_heat_source_utilisation_profile=xr.open_dataarray(
+            snakemake.input.direct_heat_source_utilisation_profiles
+        ),
         head=snakemake.params.district_heating["add_subnodes"],
     )
 
-    if snakemake.config["foresight"] == "myopic":
-        cops = xr.open_dataarray(snakemake.input.cop_profiles)
-        cops_extended = extend_cops(cops, subnodes)
-        cops_extended.to_netcdf(snakemake.output.cop_profiles_extended)
+    # if snakemake.config["foresight"] == "myopic":
+    #     cops = xr.open_dataarray(snakemake.input.cop_profiles)
+    #     cops_extended = extend_cops(cops, subnodes)
+    #     cops_extended.to_netcdf(snakemake.output.cop_profiles_extended)
 
     if snakemake.wildcards.planning_horizons == str(snakemake.params["baseyear"]):
         existing_heating_distribution = pd.read_csv(
