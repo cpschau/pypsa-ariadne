@@ -24,13 +24,13 @@ def carbon_component_fossils(costs, co2_price):
 
     for c in carriers:
         carbon_add_on = specific_emisisons[c] * co2_price
-        costs.at[(c, "fuel"), "value"] += carbon_add_on
+        costs.loc[(c, "fuel"), "value"] += carbon_add_on
         add_str = f" (added carbon component of {round(carbon_add_on,4)} €/MWh according to co2 price of {co2_price} €/t co2 and carbon intensity of {specific_emisisons[c]} t co2/MWh)"
-        if pd.isna(costs.at[(c, "fuel"), "further description"]):
-            costs.at[(c, "fuel"), "further description"] = add_str
+        if pd.isna(costs.loc[(c, "fuel"), "further description"]):
+            costs.loc[(c, "fuel"), "further description"] = add_str
         else:
-            costs.at[(c, "fuel"), "further description"] = (
-                str(costs.at[(c, "fuel"), "further description"]) + add_str
+            costs.loc[(c, "fuel"), "further description"] = (
+                str(costs.loc[(c, "fuel"), "further description"]) + add_str
             )
 
     return costs
@@ -40,17 +40,22 @@ if __name__ == "__main__":
     if "snakemake" not in globals():
         import sys
 
-        path = "../submodules/pypsa-eur/scripts"
+        # path = "../submodules/pypsa-eur/scripts"
+        path = "pypsa-ariadne/workflow/submodules/pypsa-eur/scripts"
         sys.path.insert(0, os.path.abspath(path))
         from _helpers import mock_snakemake
 
+        import os
+
+        os.chdir(os.path.dirname(os.path.abspath(__file__)))
+
         snakemake = mock_snakemake(
             "modify_cost_data",
-            planning_horizons="2020",
+            planning_horizons="2025",
             file_path="../data/costs/",
-            file_name="costs_2020.csv",
+            file_name="costs_2025.csv",
             cost_horizon="mean",
-            run="KN2045_Bal_v4",
+            run="0.5LTESCAPEX",
         )
     logger = logging.getLogger(__name__)
 
@@ -119,12 +124,12 @@ if __name__ == "__main__":
     logger.warning("Scaling onwind costs towards Fh-ISE  for Germany.")
     # https://github.com/PyPSA/pypsa-ariadne/issues/179
     # https://www.ise.fraunhofer.de/de/veroeffentlichungen/studien/studie-stromgestehungskosten-erneuerbare-energien.html
-    costs.at[("onwind", "investment"), "value"] *= 1.12
+    costs.loc[("onwind", "investment"), "value"] *= 1.12
     print(costs.loc["onwind", "investment"])
 
     logger.warning("Adding transport costs of 8.8 EUR/MWh to pelletizing costs.")
     # Assumption based on doi:10.1016/j.rser.2019.109506
-    costs.at[("biomass boiler", "pelletizing cost"), "value"] += 8.8
+    costs.loc[("biomass boiler", "pelletizing cost"), "value"] += 8.8
     print(costs.loc["biomass boiler", "pelletizing cost"])
 
     costs.to_csv(snakemake.output[0])

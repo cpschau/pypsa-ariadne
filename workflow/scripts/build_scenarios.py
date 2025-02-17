@@ -57,11 +57,23 @@ def get_DRI_share(df, planning_horizons):
     model = "FORECAST v1.0"
     total_steel = df.loc[model, "Production|Steel|Primary"]
     # Assuming that only hydrogen DRI steel is sustainable and DRI using natural gas is phased out
-    DRI_steel = df.loc[model, "Production|Steel|Primary|Direct Reduction Hydrogen"]
+    # try:
+    #     DRI_steel = df.loc[model, "Production|Steel|Primary|Direct Reduction Hydrogen"]
+    # except KeyError:
+    #     DRI_steel = (
+    #         pd.Series(snakemake.config["industry"]["DRI_fraction"]) * total_steel
+    #     ).backfill()
+    DRI_steel = (
+        pd.Series(snakemake.config["industry"]["DRI_fraction"]) * total_steel
+    ).bfill()
 
     DRI_steel_share = DRI_steel / total_steel
 
-    if model == "FORECAST v1.0" and planning_horizons[0] == 2020:
+    if (
+        model == "FORECAST v1.0"
+        and planning_horizons[0] == 2020
+        and "public" not in snakemake.config["run"]["scenarios"]["manual_file"]
+    ):
         logger.warning(
             "FORECAST v1.0 does not have data for 2020. Using 2021 data for DRI fraction instead."
         )
@@ -182,7 +194,8 @@ def write_to_scenario_yaml(input, output, scenarios, df):
             df.loc[:, fallback_reference_scenario, :], planning_horizons
         )
 
-        config[scenario]["sector"] = {}
+        if "sector" not in config[scenario]:
+            config[scenario]["sector"] = {}
 
         config[scenario]["sector"]["aviation_demand_factor"] = {}
         for year in planning_horizons:
@@ -208,6 +221,11 @@ def write_to_scenario_yaml(input, output, scenarios, df):
                 dri_fraction.loc["DRI_Steel_Share", year].item(), 4
             )
 
+        if "solving" not in config[scenario]:
+            config[scenario]["solving"] = {}
+        if "constraints" not in config[scenario]["solving"]:
+            config[scenario]["solving"]["constraints"] = {}
+
         config[scenario]["solving"]["constraints"]["co2_budget_national"] = {}
         for year, target in co2_budget_fractions.items():
             config[scenario]["solving"]["constraints"]["co2_budget_national"][year] = {}
@@ -224,7 +242,7 @@ if __name__ == "__main__":
         import os
         import sys
 
-        path = "../submodules/pypsa-eur/scripts"
+        path = "pypsa-ariadne/workflow/submodules/pypsa-eur/scripts"
         sys.path.insert(0, os.path.abspath(path))
         from _helpers import mock_snakemake
 

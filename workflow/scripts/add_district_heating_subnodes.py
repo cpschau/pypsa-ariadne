@@ -8,6 +8,23 @@ import numpy as np
 import pandas as pd
 import pypsa
 import xarray as xr
+import sys
+import os
+
+paths = [
+    "workflow/submodules/pypsa-eur/scripts",
+    "pypsa-ariadne/workflow/submodules/pypsa-eur/scripts",
+    "../submodules/pypsa-eur/scripts",
+    "../submodules/pypsa-eur/",
+]
+for path in paths:
+    sys.path.insert(0, os.path.abspath(path))
+from prepare_network import maybe_adjust_costs_and_potentials
+from _helpers import (
+    configure_logging,
+    set_scenario_config,
+    update_config_from_wildcards,
+)
 
 import shapely
 import rasterio
@@ -144,30 +161,29 @@ def add_subnodes(n, subnodes, cop, direct_heat_source_utilisation_profile, head=
             n.loads.loc[f"{row['cluster']} low-temperature heat for industry", "p_set"]
             * 8760
         )
-        dh_load_cluster = uch_load_cluster + lti_load_cluster
-        lti_share = lti_load_cluster / dh_load_cluster
 
+        dh_load_cluster = uch_load_cluster + lti_load_cluster
         scalar = min(
             1,
             (row["yearly_heat_demand_MWh"] / dh_load_cluster),
         )
 
-        lost_load = row["yearly_heat_demand_MWh"] - dh_load_cluster
+        dh_load_cluster_subnodes = subnodes.loc[
+            subnodes.cluster == row["cluster"], "yearly_heat_demand_MWh"
+        ].sum()
+        lost_load = dh_load_cluster_subnodes - dh_load_cluster
+        if dh_load_cluster_subnodes > dh_load_cluster:
+            logger.warning(
+                f"Aggregated district heating load of systems within {row['cluster']} exceeds load of cluster. {lost_load} MWh/a are disregarded."
+            )
+            scalar *= row["yearly_heat_demand_MWh"] / dh_load_cluster_subnodes
 
-        if scalar == 1:
-            logger.info(
-                f"District heating load of {row['Stadt']} exceeds load of its assigned cluster {row['cluster']}. {lost_load} MWh/a are disregarded."
-            )
-        uch_load = (
-            scalar
-            * (1 - lti_share)
-            * n.loads_t.p_set[f"{row['cluster']} urban central heat"].rename(
-                f"{row['cluster']} {row['Stadt']} urban central heat"
-            )
-        )
+        uch_load = scalar * n.loads_t.p_set[
+            f"{row['cluster']} urban central heat"
+        ].rename(f"{row['cluster']} {row['Stadt']} urban central heat")
         n.add(
             "Load",
-            name,
+            f"{name} heat",
             bus=f"{name} heat",
             p_set=uch_load,
             carrier="urban central heat",
@@ -176,7 +192,6 @@ def add_subnodes(n, subnodes, cop, direct_heat_source_utilisation_profile, head=
 
         lti_load = (
             scalar
-            * lti_share
             * n.loads.loc[
                 f"{row['cluster']} low-temperature heat for industry", "p_set"
             ]
@@ -191,16 +206,31 @@ def add_subnodes(n, subnodes, cop, direct_heat_source_utilisation_profile, head=
         )
 
         # Adjust loads of cluster buses
-        n.loads_t.p_set.loc[:, f'{row["cluster"]} urban central heat'] *= 1 - scalar * (
-            1 - lti_share
-        )
+        n.loads_t.p_set.loc[:, f'{row["cluster"]} urban central heat'] *= 1 - scalar
+
         n.loads.loc[f'{row["cluster"]} low-temperature heat for industry', "p_set"] *= (
-            1 - scalar * lti_share
+            1 - scalar
         )
 
-        # Replicate district heating stores of mother node for subnodes
-        stores = (
-            n.stores.filter(like=f"{row['cluster']} urban central", axis=0)
+        # # Replicate district heating stores of mother node for subnodes
+        # stores = (
+        #     n.stores.filter(like=f"{row['cluster']} urban central", axis=0)
+        #     .reset_index()
+        #     .replace(
+        #         {
+        #             f"{row['cluster']} urban central": f"{row['cluster']} {row['Stadt']} urban central"
+        #         },
+        #         regex=True,
+        #     )
+        #     .set_index("Store")
+        # )
+
+        # stores["e_nom_max"] = row["ptes_pot_mwh"]
+        # n.add("Store", stores.index, **stores)
+
+        # Replicate district heating storage units of mother node for subnodes
+        storage_units = (
+            n.storage_units.filter(like=f"{row['cluster']} urban central", axis=0)
             .reset_index()
             .replace(
                 {
@@ -208,19 +238,24 @@ def add_subnodes(n, subnodes, cop, direct_heat_source_utilisation_profile, head=
                 },
                 regex=True,
             )
-            .set_index("Store")
+            .set_index("StorageUnit")
         )
 
-        stores["e_nom_max"] = row["ptes_pot_mwh"]
-        n.add("Store", stores.index, **stores)
+        storage_units.loc[storage_units.carrier.str.contains("pits$"), "p_nom_max"] = (
+            row["ptes_pot_mwh"] / storage_units["max_hours"]
+        )
+        n.add("StorageUnit", storage_units.index, **storage_units)
 
         # restrict PTES capacity in mother nodes
         mother_nodes_ptes_pot = subnodes_rest.groupby("cluster").ptes_pot_mwh.sum()
         # add " urban central water tanks" to the mother node name
         mother_nodes_ptes_pot.index = (
-            mother_nodes_ptes_pot.index + " urban central water tanks"
+            mother_nodes_ptes_pot.index + " urban central water pits"
         )
-        n.stores.loc[mother_nodes_ptes_pot.index, "e_nom_max"] = mother_nodes_ptes_pot
+        n.storage_units.loc[mother_nodes_ptes_pot.index, "p_nom_max"] = (
+            mother_nodes_ptes_pot
+            / n.storage_units.loc[mother_nodes_ptes_pot.index, "max_hours"]
+        )
 
         # Replicate district heating generators of mother node for subnodes
         generators = (
@@ -281,16 +316,16 @@ def add_subnodes(n, subnodes, cop, direct_heat_source_utilisation_profile, head=
                 .drop(["efficiency", "efficiency2"], axis=1)
                 .set_index("Link")
             )
-            if heat_pump["bus2"].notna().any():
+            if heat_pump["bus2"].str.match("$").any():
+                n.add("Link", heat_pump.index, efficiency=cop_heat_pump, **heat_pump)
+            else:
                 n.add(
                     "Link",
                     heat_pump.index,
-                    efficiency=-(1 - cop_heat_pump),
+                    efficiency=-(cop_heat_pump - 1),
                     efficiency2=cop_heat_pump,
                     **heat_pump,
                 )
-            else:
-                n.add("Link", heat_pump.index, efficiency=cop_heat_pump, **heat_pump)
 
             if heat_source in snakemake.params.direct_utilisation_heat_sources:
                 # Add direct heat source utilization to subnode
@@ -463,9 +498,13 @@ if __name__ == "__main__":
             opts="",
             ll="vopt",
             sector_opts="none",
-            planning_horizons="2020",
-            run="KN2045_Bal_v4",
+            planning_horizons="2045",
+            run="No_PTES",
         )
+
+    configure_logging(snakemake)
+    set_scenario_config(snakemake)
+    update_config_from_wildcards(snakemake.config, snakemake.wildcards)
 
     logger.info("Adding SysGF-specific functionality")
 
@@ -521,4 +560,8 @@ if __name__ == "__main__":
         # write empty file to output
         with open(snakemake.output.existing_heating_distribution_extended, "w") as f:
             pass
+
+    maybe_adjust_costs_and_potentials(
+        n, snakemake.params["adjustments"], snakemake.wildcards.planning_horizons
+    )
     n.export_to_netcdf(snakemake.output.network)

@@ -46,6 +46,17 @@ def prepare_subnodes(subnodes, cities, regions_onshore, lau, heat_techs):
     subnodes["cluster"] = subnodes.apply(
         lambda x: regions_onshore.geometry.contains(x.geometry).idxmax(), axis=1
     )
+    # For cities that are assigned to onshore regions outside Germany assign closest German cluster
+    subnodes.loc[~subnodes.cluster.str.contains("DE"), "cluster"] = subnodes.loc[
+        ~subnodes.cluster.str.contains("DE")
+    ].apply(
+        lambda x: (
+            regions_onshore.filter(like="DE", axis=0)
+            .geometry.distance(x.geometry)
+            .idxmin()
+        ),
+        axis=1,
+    )
     subnodes["lau"] = subnodes.apply(
         lambda x: lau.loc[lau.geometry.contains(x.geometry).idxmax(), "LAU_ID"], axis=1
     )
@@ -67,15 +78,15 @@ def prepare_subnodes(subnodes, cities, regions_onshore, lau, heat_techs):
     return subnodes
 
 
-def extend_regions_onshore(regions_onshore, subnodes, head=40):
+def extend_regions_onshore(regions_onshore, subnodes_all, head=40):
+    subnodes_all["lau_shape"] = subnodes_all["lau_shape"].apply(shapely.wkt.loads)
     if isinstance(head, bool):
         head = 40
     # Extend regions_onshore to include the cities' lau regions
-    subnodes = subnodes.sort_values(
+    subnodes = subnodes_all.sort_values(
         by="Wärmeeinspeisung in GWh/a", ascending=False
     ).head(head)[["Stadt", "cluster", "lau_shape"]]
-    # Apply wkt loads on lau_shape annd convert to geodataframe
-    subnodes["lau_shape"] = subnodes["lau_shape"].apply(shapely.wkt.loads)
+
     subnodes = gpd.GeoDataFrame(subnodes, crs="EPSG:4326", geometry="lau_shape")
     # Create column name that comprises cluster and Stadt
     subnodes["name"] = subnodes["cluster"] + " " + subnodes["Stadt"]
@@ -90,7 +101,20 @@ def extend_regions_onshore(regions_onshore, subnodes, head=40):
     )
     # Concat regions_onshore and subnodes
     regions_onshore_extended = pd.concat([regions_onshore, subnodes.set_index("name")])
-    return regions_onshore_extended
+
+    # Restrict regions_onshore geometries to only consist of the remaining city areas
+    subnodes_rest = subnodes_all[~subnodes_all["Stadt"].isin(subnodes["name"])]
+
+    subnodes_rest_dissolved = subnodes_rest.set_geometry("lau_shape").dissolve(
+        "cluster"
+    )
+    # regions_onshore_restricted should replace geometries of regions_onshore with the geometries of subnodes_rest
+    regions_onshore_restricted = regions_onshore_extended.copy()
+    regions_onshore_restricted.loc[subnodes_rest_dissolved.index, "geometry"] = (
+        subnodes_rest_dissolved["lau_shape"]
+    )
+
+    return regions_onshore_extended, regions_onshore_restricted
 
 
 if __name__ == "__main__":
@@ -105,14 +129,14 @@ if __name__ == "__main__":
         from _helpers import mock_snakemake
 
         snakemake = mock_snakemake(
-            "add_district_heating_subnodes",
+            "prepare_district_heating_subnodes",
             simpl="",
             clusters=27,
             opts="",
             ll="vopt",
             sector_opts="none",
-            planning_horizons="2020",
-            run="KN2045_Bal_v4",
+            planning_horizons="2045",
+            run="LowGroundWaterDepth",
         )
 
     logger.info("Adding SysGF-specific functionality")
@@ -147,7 +171,7 @@ if __name__ == "__main__":
     )
     subnodes.to_file(snakemake.output.district_heating_subnodes, driver="GeoJSON")
 
-    regions_onshore_extended = extend_regions_onshore(
+    regions_onshore_extended, regions_onshore_restricted = extend_regions_onshore(
         regions_onshore,
         subnodes,
         head=snakemake.params.district_heating["add_subnodes"],
@@ -155,4 +179,8 @@ if __name__ == "__main__":
 
     regions_onshore_extended.to_file(
         snakemake.output.regions_onshore_extended, driver="GeoJSON"
+    )
+
+    regions_onshore_restricted.to_file(
+        snakemake.output.regions_onshore_restricted, driver="GeoJSON"
     )

@@ -62,18 +62,18 @@ from pathlib import Path
 data_dir = Path("workflow/submodules/pypsa-eur/data")
 
 
-rule get_data:
-    output:
-        [
-            str(Path("data") / p.relative_to(data_dir))
-            for p in data_dir.rglob("*")
-            if p.is_file()
-        ],
-    shell:
-        """
-        mkdir -p data
-        cp -nR {data_dir}/. data/
-        """
+# rule get_data:
+#     output:
+#         [
+#             str(Path("data") / p.relative_to(data_dir))
+#             for p in data_dir.rglob("*")
+#             if p.is_file()
+#         ],
+#     shell:
+#         """
+#         mkdir -p data
+#         cp -nR {data_dir}/. data/
+#         """
 
 
 rule clean:
@@ -211,6 +211,50 @@ rule build_egon_data:
         "scripts/build_egon_data.py"
 
 
+rule add_district_heating_subnodes:
+    params:
+        district_heating=config_provider("sector", "district_heating"),
+        baseyear=config_provider("scenario", "planning_horizons", 0),
+    input:
+        network=RESULTS
+        + "prenetworks/base_s_{clusters}_l{ll}_{opts}_{sector_opts}_{planning_horizons}.nc",
+        heating_technologies_nuts3=resources("heating_technologies_nuts3.geojson"),
+        nuts3=resources("nuts3_shapes.geojson"),
+        regions_onshore=resources(
+            "regions_onshore_base_s_{clusters}.geojson"
+        ),
+        fernwaermeatlas="data/fernwaermeatlas/fernwaermeatlas.xlsx",
+        cities="data/fernwaermeatlas/cities_geolocations.geojson",
+        cop_profiles=resources("cop_profiles_base_s_{clusters}_{planning_horizons}.nc"),
+        existing_heating_distribution=resources(
+            f"existing_heating_distribution_base_s_{{clusters}}_{baseyear_value}.csv"
+        ),
+        lau=storage(
+            "https://gisco-services.ec.europa.eu/distribution/v2/lau/download/ref-lau-2021-01m.geojson.zip",
+            keep_local=True,
+        ),
+    output:
+        network=RESULTS
+        + "prenetworks/base-extended_s_{clusters}_l{ll}_{opts}_{sector_opts}_{planning_horizons}.nc",
+        district_heating_subnodes=resources(
+            "district_heating_subnodes_base_s_{clusters}_l{ll}_{opts}_{sector_opts}_{planning_horizons}.geojson"
+        ),
+        cop_profiles_extended=resources(
+            "cop_profiles_base-extended_s_{clusters}_l{ll}_{opts}_{sector_opts}_{planning_horizons}.nc"
+        ),
+        existing_heating_distribution_extended=(
+            resources(
+                "existing_heating_distribution_base-extended_s_{clusters}_l{ll}_{opts}_{sector_opts}_{planning_horizons}.csv"
+            )
+            if baseyear_value != "{planning_horizons}"
+            else []
+        ),
+    resources:
+        mem_mb=1000,
+    script:
+        "scripts/add_district_heating_subnodes.py"
+        
+
 if config["sector"]["district_heating"]["add_subnodes"] and config["sector"][
     "district_heating"
 ].get("add_subnodes", True):
@@ -236,6 +280,9 @@ if config["sector"]["district_heating"]["add_subnodes"] and config["sector"][
             ),
             regions_onshore_extended=resources(
                 "regions_onshore_base-extended_s_{clusters}.geojson"
+            ),
+            regions_onshore_restricted=resources(
+                "regions_onshore_base-restricted_s_{clusters}.geojson"
             ),
 
         resources:
@@ -288,7 +335,7 @@ if config["sector"]["district_heating"]["add_subnodes"] and config["sector"][
                 if k != "regions_onshore"
             },
             regions_onshore=resources(
-                "regions_onshore_base-extended_s_{clusters}.geojson"
+                "regions_onshore_base-restricted_s_{clusters}.geojson"
             ),
 
 
@@ -306,6 +353,7 @@ if config["sector"]["district_heating"]["add_subnodes"] and config["sector"][
             direct_utilisation_heat_sources=config_provider(
                 "sector", "district_heating", "direct_utilisation_heat_sources"
             ),
+            adjustments=config_provider( "adjustments", "sector"),
         input:
             unpack(input_heat_source_potentials),
             network=RESULTS
